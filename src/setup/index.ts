@@ -1,0 +1,15 @@
+export const rpID = process.env.RP_ID || 'localhost'; // TODO: Replace with actual RP ID
+export const rpName = process.env.RP_NAME || 'WebAuthn Example'; // TODO: Replace with actual RP Name
+export const expectedOrigin = process.env.RP_ORIGIN || 'http://localhost:3001';
+export const port = process.env.PORT || 3000;
+export const host = process.env.HOST || 'localhost';
+export const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
+export const mongodbUri = process.env.MONGODB_URI || 'mongodb://localhost:27017';
+export const dbName = process.env.DB_NAME || 'passkeys';
+export const collectionName = process.env.COLLECTION_NAME || 'users';
+export const sessionKey = process.env.SESSION_SECRET;
+export const logLevel = process.env.LOG_LEVEL || 'info';
+export const rateLimitMax = process.env.RATE_LIMIT_MAX || 100;
+export const rateLimitTimeWindow = process.env.RATE_LIMIT_TIME_WINDOW || '1 minute';
+export const registrationTimeout = process.env.REGISTRATION_TIMEOUT || 60000;
+export const environment = process.env.NODE_ENV || 'development';

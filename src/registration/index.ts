@@ -1,62 +1,37 @@
-import { generateRegistrationOptions, GenerateRegistrationOptionsOpts, RegistrationResponseJSON, verifyAuthenticationResponse, VerifyAuthenticationResponseOpts, verifyRegistrationResponse, WebAuthnCredential } from "@simplewebauthn/server";
-import { LoggedInUser } from "../types";
-import { FastifyRequest } from "fastify";
-
-/**
- * 2FA and Passwordless WebAuthn flows expect you to be able to uniquely identify the user that
- * performs registration or authentication. The user ID you specify here should be your internal,
- * _unique_ ID for that user (uuid, etc...). Avoid using identifying information here, like email
- * addresses, as it may be stored within the credential.
- *
- * Here, the example server assumes the following user has completed login:
- */
-const loggedInUserId = '75f45645-fec7-45f4-84bf-73eb31538550'; // TODO: Replace with actual user ID
-const rpID = 'localhost'; // TODO: Replace with actual RP ID
-const loggedInUserDisplayName = 'John Doe';
-const rpName = 'WebAuthn Example'; // TODO: Replace with actual RP Name
-
-const inMemoryUserDB: { [loggedInUserId: string]: LoggedInUser } = {
-    [loggedInUserId]: {
-        id: loggedInUserId,
-        username: `user@${rpID}`,
-        credentials: [],
-    },
-};
-
+import { generateRegistrationOptions, GenerateRegistrationOptionsOpts, RegistrationResponseJSON, verifyRegistrationResponse, WebAuthnCredential } from "@simplewebauthn/server";
+import { rpID, rpName, expectedOrigin, registrationTimeout } from "../setup"
+import { createUser, getUser, updateUser } from "../infra/database/database";
+import { v4 as uuidv4 } from 'uuid';
+import { redis } from "../infra/database/redis";
+import { logger } from "../infra/logger";
 /**
  * Get Registration Options
- * @param userId - The user ID of the logged in user
+ * @param username - The username of the logged in user
  * @returns The registration options for the user
  */
-export const getRegistrationOptions = async (userId: string) => {
-    const user = inMemoryUserDB[userId];
+export const getRegistrationOptions = async (username: string) => {
+    let user = await getUser(username);
     if (!user) {
-        throw new Error('User not found');
+        logger.info(`Creating user ${username}`);
+        await createUser({
+            id: uuidv4(),
+            username: username,
+            credentials: [],
+            displayName: username,
+        });
+        user = await getUser(username);
+        logger.info(`User ${username} created`);
     }
-
-    const {
-        /**
-         * The username can be a human-readable name, email, etc... as it is intended only for display.
-         */
-        username,
-        credentials,
-    } = user;
 
     const options: GenerateRegistrationOptionsOpts = {
         rpName,
         rpID,
         userName: username,
-        userID: new TextEncoder().encode(userId),
-        userDisplayName: loggedInUserDisplayName,
-        timeout: Number(process.env.REGISTRATION_TIMEOUT) || 60000,
+        userID: new TextEncoder().encode(user?.id),
+        userDisplayName: user?.displayName,
+        timeout: Number(registrationTimeout) || 60000,
         attestationType: 'none',
-        /**
-         * Passing in a user's list of already-registered credential IDs here prevents users from
-         * registering the same authenticator multiple times. The authenticator will simply throw an
-         * error in the browser if it's asked to perform registration when it recognizes one of the
-         * credential ID's.
-         */
-        excludeCredentials: credentials.map((cred) => ({
+        excludeCredentials: user!.credentials.map((cred) => ({
             id: cred.id,
             type: 'public-key',
             transports: cred.transports,
@@ -65,13 +40,19 @@ export const getRegistrationOptions = async (userId: string) => {
             residentKey: 'discouraged',
             userVerification: 'preferred',
         },
-        /**
-         * Support the two most common algorithms: ES256, and RS256
-         */
         supportedAlgorithmIDs: [-7, -257],
     };
 
+    logger.debug(`Generating registration options for user ${username}`);
+
     const registrationOptions = await generateRegistrationOptions(options);
+
+    logger.info(`Registration options generated for user ${username}`);
+
+    // Store challenge in Redis with 5-minute expiration
+    await redis.setex(`challenge:${username}-registration`, 300, registrationOptions.challenge);
+
+    logger.debug(`Challenge stored in Redis for user ${username}`);
 
     return registrationOptions;
 };
@@ -79,41 +60,58 @@ export const getRegistrationOptions = async (userId: string) => {
 
 /**
  * Verify Registration
- * @param userId - The user ID of the logged in user
- * @param expectedChallenge - The expected challenge
+ * @param username - The username of the logged in user
  * @param registrationResponse - The registration response
  * @returns The verified registration response
  */
-export const verifyRegistration = async (userId: string, expectedChallenge: string, registrationResponse: RegistrationResponseJSON) => {
-    const user = inMemoryUserDB[userId];
+export const verifyRegistration = async (username: string, registrationResponse: RegistrationResponseJSON) => {
+    const user = await getUser(username);
     if (!user) {
+        logger.error(`User ${username} not found`);
         throw new Error('User not found');
     }
 
-    // Find existing credential by ID
-    const existingCredential = user.credentials.find(
-        (cred: WebAuthnCredential) => cred.id === registrationResponse.id
-    );
+    logger.debug(`Verifying registration for user ${username}`);
 
-    if (existingCredential) {
-        throw new Error('Authenticator is already registered with this site');
+    const expectedChallenge = await redis.get(`challenge:${username}-registration`);
+    logger.debug(`Expected challenge: ${expectedChallenge}`);
+    if (!expectedChallenge) {
+        logger.error(`No challenge found or challenge expired for user ${username}`);
+        throw new Error('No challenge found or challenge expired');
     }
+
+    logger.debug(`Registration response: ${JSON.stringify(registrationResponse)}`);
 
     try {
         const verification = await verifyRegistrationResponse({
             response: registrationResponse,
             expectedChallenge: `${expectedChallenge}`,
-            expectedOrigin: `http://${rpID}`,
+            expectedOrigin: expectedOrigin,
             expectedRPID: rpID,
             requireUserVerification: false,
         });
 
         const { verified, registrationInfo } = verification;
-
-        if (verified && existingCredential && registrationInfo?.credential) {
+        logger.debug(`Verification result: ${JSON.stringify(verification)}`);
+        if (verified && registrationInfo?.credential) {
             // Update the credential's counter in the DB to the newest count in the authentication
-            const credential = existingCredential as WebAuthnCredential;
+            const { credential } = registrationInfo;
             credential.counter = registrationInfo.credential.counter;
+
+            const existingCredential = user.credentials.find((cred) => cred.id === credential.id);
+
+            if (!existingCredential) {
+                logger.info(`Adding credential to user ${user.username}`);
+                const newCredential: WebAuthnCredential = {
+                    id: credential.id,
+                    publicKey: credential.publicKey,
+                    counter: credential.counter,
+                    transports: registrationResponse.response.transports,
+                };
+                user.credentials.push(newCredential);
+                await updateUser(user.id, { credentials: user.credentials });
+                logger.info(`Credential added to user ${user.username}`);
+            }
         }
 
         return verified;

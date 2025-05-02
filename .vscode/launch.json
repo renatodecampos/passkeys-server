@@ -1,0 +1,22 @@
+{
+    "configurations": [
+        {
+            "name": "Launch Program",
+            "request": "launch",
+            "type": "node",
+            "program": "${workspaceFolder}/src/index.ts",
+            "outFiles": [
+                "${workspaceFolder}/src/**/*.js"
+            ]
+        },
+        {
+            "name": "Attach",
+            "request": "attach",
+            "type": "node",
+            "port": 9229,
+            "outFiles": [
+                "${workspaceFolder}/src/**/*.js"
+            ]
+        }
+    ]
+}
